@@ -1,47 +1,43 @@
+"""SHMIP Suite A: steady-state distributed recharge on a rectangular ice sheet.
+
+Usage: python run_shmip_A.py [--cases A3 A4 A5] [--plot-ribbons]
+Output: outputs/{checkpoints,csv,A_Nx.png,A_curves.npz}
+"""
+
 import os
 import math
 import argparse
 import numpy as np
 import firedrake as fd
 import matplotlib.pyplot as plt
-from hydropack.models.glads import Glads2DModel
-from hydropack.constants import pcs as default_pcs
+from hydropack.models.subglacialhydrology import SubglacialHydrologyModel
+from hydropack.constants import ice_density, water_density, gravity
 
-pcs = dict(default_pcs)
+Lx = 100e3
+Ly = 20e3
+nx = 115
+ny = 23
 
-# ---------- experiment config ----------
-# Domain (ice-sheet rectangle used by SHMIP)
-Lx = 100e3  # 100 km
-Ly = 20e3   # 20 km
-nx = 200
-ny = 40
-
-# Cases A1..A6, distributed recharge rates.
-# Values here are examples; set to your chosen SHMIP rates (m/s).
-# e.g. 2.5 mm/a, 10 mm/d, ..., 50 mm/d converted to m/s
 A_RATES = {
-    "A1": 7.93e-11,   # 2.5 mm/a -> m/s
-    "A2": 1.59e-9,             # 2 mm/d  -> m/s
-    "A3": 5.79e-9,             # etc.
+    "A1": 7.93e-11,
+    "A2": 1.59e-9,
+    "A3": 5.79e-9,
     "A4": 2.5e-8,
     "A5": 4.5e-8,
     "A6": 5.79e-7,
 }
 
-# Timestep + steady criteria
-dt = 60*30/8             # 30 minutes
-max_steps = 20000       # safety
-rel_tol = 5e-4          # steady if relative change below this for N and phi
-check_every = 50        # assess steady state every N steps
+dt = 14400
+max_steps = 30000
+rel_tol = 5e-4
+check_every = 6
 
-# output
 OUTDIR = "outputs"
 PLOT_PNG = os.path.join(OUTDIR, "A_Nx.png")
 CSV_DIR = os.path.join(OUTDIR, "csv")
 CHK_DIR = os.path.join(OUTDIR, "checkpoints")
 
 
-# ---------- helpers ----------
 def build_mesh():
     return fd.RectangleMesh(nx, ny, Lx, Ly)
 
@@ -65,133 +61,99 @@ def expand_cases(sel):
                 out.extend(CASES_ALL[lo:hi+1])
         elif s in CASES_ALL:
             out.append(s)
-    # dedupe, preserve order
     seen = set()
     return [c for c in out if not (c in seen or seen.add(c))]
 
 
 def make_model_inputs(mesh):
-    """
-    Replace this stub with your existing builder that returns the
-    'model_inputs' dict hydropack expects. It MUST include:
-      mesh, thickness (H), bed (B), u_b, m, h_init, phi_init, phi_m, p_i, phi_0, d_bcs, S_init, constants
-    Here we create minimal placeholders you should wire to your real fields.
-    """
+    """Build Firedrake fields for SubglacialHydrologyModel."""
     Q = fd.FunctionSpace(mesh, "CG", 1)
     V = fd.VectorFunctionSpace(mesh, "CG", 1)
     CR = fd.FunctionSpace(mesh, "CR", 1)
-    
+
     x, y = fd.SpatialCoordinate(mesh)
 
-    # --- YOU: replace with real initial/forcings/topo ---
-    S = fd.interpolate(6*(fd.sqrt(x + 5000) - fd.sqrt(5000.0)) + 1, Q)         # 1 km ice
-    B = fd.interpolate(fd.Constant(0.0), Q)            # flat bed
-    u = fd.interpolate(fd.as_vector((1e-6, 0.0)), V)  # 100 m/yr-ish along x (replace with your actual)
+    S = fd.interpolate(6*(fd.sqrt(x + 5000) - fd.sqrt(5000.0)) + 1, Q)
+    B = fd.interpolate(fd.Constant(0.0), Q)
+    u = fd.interpolate(fd.as_vector((1e-6, 0.0)), V)
     u_b = fd.Function(Q).interpolate(fd.sqrt(fd.inner(u,u)))
 
-    #u_b.assign(0.0)  # or set from data
     H = S-B
 
-    # distributed melt (we overwrite per A-case later)
     m = fd.Function(Q).interpolate(fd.Constant(0.0))
 
-    # Initial conditions
-    h_init = fd.interpolate(fd.Constant(0.0001), Q)      # 1 cm sheet
-    S_init = fd.interpolate(fd.Constant(0.001), CR)       # no channels initially
-    phi_init = fd.interpolate(fd.Constant(0.0001), Q)     # to be solved
-    # potentials/pressures
-    p_i = fd.Function(Q).interpolate(fd.Constant(pcs['rho_ice'] * pcs['g']) * H)
-    phi_m = fd.Function(Q).interpolate(fd.Constant(pcs['rho_water'] * pcs['g']) * B)
+    p_i = fd.Function(Q).interpolate(fd.Constant(ice_density * gravity) * H)
+    phi_m = fd.Function(Q).interpolate(fd.Constant(water_density * gravity) * B)
     phi_0 = fd.Function(Q).interpolate(p_i + phi_m)
-    bc = fd.DirichletBC(Q,phi_m,1)
+    bc = fd.DirichletBC(Q, phi_m, 1)
 
+    h_init   = fd.interpolate(fd.Constant(0.0001), Q)
+    S_init   = fd.interpolate(fd.Constant(0.001), CR)
+    phi_init = fd.Function(Q).interpolate(phi_0)
 
-    # Dirichlet BCs set later on model; just pass empty for init
-    d_bcs = [bc]
-
-
-
-    model_inputs = {
-        "mesh": mesh,
-        "h_init": h_init,
-        "S_init": S_init,
+    return {
         "thickness": H,
         "bed": B,
-        "u_b": u_b,
-        "m": m,
-        "phi_prev": phi_init,
+        "sliding_speed": u_b,
+        "melt_rate": m,
+        "h_init": h_init,
+        "S_init": S_init,
         "phi_init": phi_init,
-        "d_bcs": d_bcs,
         "phi_m": phi_m,
         "p_i": p_i,
         "phi_0": phi_0,
-        "constants": pcs,
+        "dirichlet_bcs": [bc],
+        "englacial_void_ratio": 0.0,
+        "sheet_conductivity": 0.005,
         "out_dir": OUTDIR,
     }
-    return model_inputs
 
 def set_distributed_recharge(model, rate_m_per_s):
-    # model.m is a CG function; set uniform rate
     model.m.interpolate(fd.Constant(rate_m_per_s))
 
-def advance_to_steady(model, dt, *, rel_tol=1e-3, max_steps=5000, check_every=25, check_h=False):
-    """
-    March forward the *coupled* system until steady state:
-      ‖phi - phi_prev‖ / (‖phi‖ + eps) < rel_tol  AND
-      ‖N   - N_prev  ‖ / (‖N  ‖ + eps) < rel_tol
-    (optionally also check h). Evaluated every 'check_every' steps.
-    """
+def advance_to_steady(model, dt, *, rel_tol=1e-3, max_steps=5000, check_every=25):
+    """Step forward until phi, N, h, and S all converge."""
     phi_prev = fd.Function(model.U).interpolate(model.phi)
     N_prev   = fd.Function(model.U).interpolate(model.N)
-    if check_h:
-        h_prev   = fd.Function(model.U).interpolate(model.h)
+    h_prev   = fd.Function(model.U).interpolate(model.h)
+    S_prev   = fd.Function(model.CR).interpolate(model.S)
 
     for k in range(1, max_steps + 1):
-        # advance the *coupled* model (phi + sheet/channel ODEs)
         model.step(dt)
 
-
         if k % check_every == 0:
-            # phi_solver.step already updates derived fields,
-            # but this ensures N_cr, dphi_ds_cr, pfo are consistent
             model.update_phi()
 
-            rphi = fd.norm(model.phi - phi_prev) / (fd.norm(model.phi))
-            rN   = fd.norm(model.N   - N_prev  ) / (fd.norm(model.N  ))
+            rphi = fd.norm(model.phi - phi_prev) / (fd.norm(model.phi) + 1e-30)
+            rN   = fd.norm(model.N   - N_prev  ) / (fd.norm(model.N  ) + 1e-30)
+            rh   = fd.norm(model.h   - h_prev  ) / (fd.norm(model.h  ) + 1e-30)
+            rS   = fd.norm(model.S   - S_prev  ) / (fd.norm(model.S  ) + 1e-30)
 
-            if check_h:
-                rh = fd.norm(model.h - h_prev) / (fd.norm(model.h))
-                print(f"iter {k}: rphi={rphi:.3e}, rN={rN:.3e}, rh={rh:.3e}")
-            else:
-                print(f"iter {k}: rphi={rphi:.3e}, rN={rN:.3e}")
+            sim_days = k * dt / 86400
+            print(f"iter {k} ({sim_days:.0f}d): rphi={rphi:.3e}, rN={rN:.3e}, rh={rh:.3e}, rS={rS:.3e}")
 
-            # refresh snapshots
             phi_prev.assign(model.phi)
             N_prev.assign(model.N)
-            if check_h:
-                h_prev.assign(model.h)
+            h_prev.assign(model.h)
+            S_prev.assign(model.S)
 
-            # convergence test
-            if (rphi < rel_tol) and (rN < rel_tol) and (not check_h or rh < rel_tol):
+            if rphi < rel_tol and rN < rel_tol and rh < rel_tol and rS < rel_tol:
                 return k
 
     print("WARNING: hit max_steps without steady convergence.")
     return max_steps
 
-def width_averaged_Nx(model, nbins=200):
-    """
-    Compute width-averaged effective pressure N(x):
-      For each x-bin, average N over all vertices in that bin.
-    Returns (x_centers, N_mean)
-    """
+def width_averaged_Nx(model, nbins=None):
+    """Bin-average N over the y-direction. Returns (x_centers, N_mean, mask)."""
     V = model.U
     coords = model.mesh.coordinates.dat.data_ro
     x = coords[:, 0]
-    # sample N at dofs (CG1 → vertex dofs)
     Nvals = model.N.dat.data_ro
 
+    if nbins is None:
+        nbins = nx
     bins = np.linspace(0.0, Lx, nbins+1)
-    idx  = np.digitize(x, bins) - 1  # 0..nbins-1
+    idx  = np.digitize(x, bins) - 1
     Nx = np.zeros(nbins)
     count = np.zeros(nbins, dtype=int)
     for i, val in zip(idx, Nvals):
@@ -203,6 +165,31 @@ def width_averaged_Nx(model, nbins=200):
     xc = 0.5 * (bins[:-1] + bins[1:])
     return xc, Nx, mask
 
+def make_ribbon_plot(cases=None, outfile="shmip_ribbons.png"):
+    """Generate ribbon plot from saved checkpoints via shmip_summary_3d.py."""
+    import subprocess, sys
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shmip_summary_3d.py")
+    if cases is None:
+        cases = CASES_ALL
+    checkpoints, labels = [], []
+    for tag in cases:
+        p = os.path.join(CHK_DIR, f"{tag}.h5")
+        if os.path.exists(p):
+            checkpoints.append(p)
+            labels.append(tag)
+        else:
+            print(f"  (skipping {tag}: no checkpoint at {p})")
+    if not checkpoints:
+        print("No checkpoints found — run the simulation first.")
+        return
+    cmd = ([sys.executable, script]
+           + checkpoints
+           + ["--labels"] + labels
+           + ["--outfile", outfile])
+    print(f"Generating ribbon plot → {outfile}")
+    subprocess.run(cmd, check=True)
+
+
 def save_checkpoint(model, tag):
     os.makedirs(CHK_DIR, exist_ok=True)
     fname = os.path.join(CHK_DIR, f"{tag}.h5")
@@ -213,11 +200,37 @@ def save_checkpoint(model, tag):
                 chk.save_function(getattr(model, name), name=name)
     return fname
 
-def main(cases=None):
+
+def try_load_prev_state(prev_tag, mesh):
+    """Load phi/h/S from a saved checkpoint to warm-start the next case."""
+    fname = os.path.join(CHK_DIR, f"{prev_tag}.h5")
+    if not os.path.exists(fname):
+        return None
+    try:
+        Q  = fd.FunctionSpace(mesh, "CG", 1)
+        CR = fd.FunctionSpace(mesh, "CR", 1)
+        with fd.CheckpointFile(fname, "r") as chk:
+            saved_mesh = chk.load_mesh()
+            phi_saved = chk.load_function(saved_mesh, name="phi")
+            h_saved   = chk.load_function(saved_mesh, name="h")
+            S_saved   = chk.load_function(saved_mesh, name="S")
+        phi_out = fd.Function(Q);  phi_out.dat.data[:] = phi_saved.dat.data_ro[:]
+        h_out   = fd.Function(Q);  h_out.dat.data[:]   = h_saved.dat.data_ro[:]
+        S_out   = fd.Function(CR); S_out.dat.data[:]   = S_saved.dat.data_ro[:]
+        print(f"  loaded warm start from checkpoint {fname}")
+        return {"phi": phi_out, "h": h_out, "S": S_out}
+    except Exception as e:
+        print(f"  Warning: could not load checkpoint {fname}: {e}")
+        return None
+
+def main(cases=None, plot_ribbons=False):
     os.makedirs(OUTDIR, exist_ok=True)
     os.makedirs(CSV_DIR, exist_ok=True)
 
-    # pick subset if requested
+    if plot_ribbons and not cases:
+        make_ribbon_plot(outfile="shmip_ribbons.png")
+        return
+
     if cases is None or len(cases) == 0:
         cases = list(A_RATES.keys())
 
@@ -225,49 +238,65 @@ def main(cases=None):
     all_x = None
     curves = {}
 
+    prev_state = None
+
+    if cases and cases[0] != "A1":
+        pred_idx = CASES_ALL.index(cases[0]) - 1
+        if pred_idx >= 0:
+            prev_state = try_load_prev_state(CASES_ALL[pred_idx], mesh)
+
     for tag in cases:
         print(f"\n=== Running {tag} ===")
         rate = A_RATES[tag]
 
-        # fresh model per case
         model_inputs = make_model_inputs(mesh)
-        model = Glads2DModel(model_inputs)
+        model = SubglacialHydrologyModel(mesh, **model_inputs)
 
-        for f in np.arange(0,1,100):
-            set_distributed_recharge(model, f*rate)
-            for _ in range(30):
-                model.step(min(300.0, dt))  # small settling
-                model.update_phi()
+        if prev_state is not None:
+            model.phi.assign(prev_state["phi"])
+            model.phi_prev.assign(prev_state["phi"])
+            model.h.assign(prev_state["h"])
+            model.S.assign(prev_state["S"])
+            model.update_phi()
+            model.update_h_cr()
+            model.update_S_alpha()
+            print(f"  warm-started from previous case")
+
+        for frac in [0.1, 0.25, 0.5, 1.0]:
+            set_distributed_recharge(model, frac * rate)
+            for _ in range(50):
+                model.step(dt)
+            model.update_phi()
 
         model.compute_flux_fields()
 
-
         set_distributed_recharge(model, rate)
-        iters = advance_to_steady(model, dt, rel_tol=rel_tol, max_steps=max_steps, check_every=25, check_h=True)
+        iters = advance_to_steady(model, dt, rel_tol=rel_tol, max_steps=max_steps, check_every=check_every)
         print(f"Converged in {iters} checks.")
 
-        # final derived updates
         model.update_phi()
         model.compute_flux_fields()
 
-        # save checkpoint
+        prev_state = {
+            "phi": fd.Function(model.U).assign(model.phi),
+            "h":   fd.Function(model.U).assign(model.h),
+            "S":   fd.Function(model.CR).assign(model.S),
+        }
+
         cpath = save_checkpoint(model, tag)
         print(f"{tag}: wrote checkpoint → {cpath}")
 
-        # diagnostics: width-averaged N(x)
         x, Nx, mask = width_averaged_Nx(model)
         if all_x is None:
             all_x = x
-        # save curve to CSV
         csv_path = os.path.join(CSV_DIR, f"{tag}_Nx.csv")
         np.savetxt(csv_path, np.c_[x, Nx], delimiter=",", header="x,N", comments="")
         print(f"{tag}: saved Nx curve → {csv_path}")
         curves[tag] = Nx
 
-    # plot all curves together
     plt.figure(figsize=(8, 4.5))
     for tag in cases:
-        plt.plot(all_x/1000.0, curves[tag], label=tag)  # x in km
+        plt.plot(all_x/1000.0, curves[tag], label=tag)
     plt.xlabel("x (km)")
     plt.ylabel("Width-averaged effective pressure N (Pa)")
     plt.title("SHMIP Suite A: N(x) at steady state")
@@ -277,11 +306,16 @@ def main(cases=None):
     plt.savefig(PLOT_PNG, dpi=200)
     print(f"Saved figure → {PLOT_PNG}")
 
-    # also save NPZ bundle
     np.savez(os.path.join(OUTDIR, "A_curves.npz"), x=all_x, **curves)
+
+    if plot_ribbons:
+        make_ribbon_plot(outfile="shmip_ribbons.png")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", nargs="*", help="Subset like A3, A3 A4 A5, A3+, or A2-A5")
+    ap.add_argument("--plot-ribbons", action="store_true",
+                    help="Generate shmip_ribbons.png from saved checkpoints "
+                         "(skips simulation if --cases is not given)")
     args = ap.parse_args()
-    main(expand_cases(args.cases))
+    main(expand_cases(args.cases), plot_ribbons=args.plot_ribbons)

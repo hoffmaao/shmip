@@ -1,7 +1,26 @@
-*.csv
+# Data files
 *.h5
+*.csv
+*.npz
+*.mat
+*.msh
+
+# Figures
 *.png
+*.pdf
+*.svg
+
+# Output directories
+outputs/
+logs/
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+
+# System
 .DS_Store
+*.swp
+*~

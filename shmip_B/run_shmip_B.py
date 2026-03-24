@@ -1,245 +1,288 @@
+"""SHMIP Suite B: steady-state moulin recharge on a rectangular ice sheet.
+
+Usage: python run_shmip_B.py [--cases B1 B3 B5]
+Output: outputs/{checkpoints,csv,B_Nx.png,B_curves.npz}
+"""
+
 import os
 import argparse
 import numpy as np
 import firedrake as fd
 import matplotlib.pyplot as plt
 
-from hydropack.models.glads import Glads2DModel
-from hydropack.constants import pcs as default_pcs
+from hydropack.models.subglacialhydrology import SubglacialHydrologyModel
+from hydropack.constants import ice_density, water_density, gravity
 
-# ---------------- domain & numerics ----------------
 Lx, Ly = 100e3, 20e3
 nx, ny = 141, 28
 
-dt = 60*30/10            # 10 min
-max_steps = 20000
-rel_tol = 5e-4
-check_every = 50
+dt          = 14400
+max_steps   = 30000
+rel_tol     = 5e-4
+check_every = 6
 
-OUTDIR = "outputs"
+OUTDIR  = "outputs"
 CSV_DIR = os.path.join(OUTDIR, "csv")
 CHK_DIR = os.path.join(OUTDIR, "checkpoints")
-FIG = os.path.join(OUTDIR, "B_Nx.png")
+FIG     = os.path.join(OUTDIR, "B_Nx.png")
 
-# ---- Suite A reference rates (m/s) used to define B forcing ----
-A1 = 7.93e-11
-A5 = 4.5e-8         # target total, as in your Suite A setup
+A1_RATE = 7.93e-11
+A5_RATE = 4.5e-8
 
-# Default B mapping (# of moulins). Adjust to match the SHMIP table you’re following.
 B_MAP = {
-    "B1": 1,
-    "B2": 10,
-    "B3": 20,
-    "B4": 50,
+    "B1":   1,
+    "B2":  10,
+    "B3":  20,
+    "B4":  50,
     "B5": 100,
 }
+CASES_ALL = ["B1", "B2", "B3", "B4", "B5"]
 
-# ---------------- helpers ----------------
+MOULIN_SIGMA = 1000.0
+MOULIN_DIR   = "moulin_positions"
+
+
 def build_mesh():
     return fd.RectangleMesh(nx, ny, Lx, Ly, quadrilateral=False)
 
+
 def make_model_inputs(mesh):
-    U  = fd.FunctionSpace(mesh, "CG", 1)
-    CR = fd.FunctionSpace(mesh, "CR", 1)
+    """Build Firedrake fields for SubglacialHydrologyModel."""
+    U   = fd.FunctionSpace(mesh, "CG", 1)
+    CR  = fd.FunctionSpace(mesh, "CR", 1)
     x, y = fd.SpatialCoordinate(mesh)
 
-    S = fd.interpolate(6*(fd.sqrt(x + 5000) - fd.sqrt(5000.0)) + 1, U)           # 1 km ice
-    B = fd.interpolate(fd.Constant(0.0), U)            # flat bed
-    u_b = fd.interpolate(fd.as_vector((1e-6, 0.0))[0], U)  # 100 m/yr-ish along x (replace with your actual)
-    #u_b.assign(0.0)  # or set from data
-    H = S-B
+    surf    = fd.interpolate(6*(fd.sqrt(x + 5000) - fd.sqrt(5000.0)) + 1, U)
+    B       = fd.interpolate(fd.Constant(0.0), U)
+    H       = surf - B
 
-    # recharge field (we’ll set it every step)
-    m = fd.Function(U); m.assign(0.0)
+    u_b     = fd.interpolate(fd.Constant(1e-6), U)
 
-    h_init  = fd.interpolate(fd.Constant(0.01), U)
-    S_init  = fd.Function(CR); S_init.assign(0.0)
-    phi_init = fd.Function(U); phi_init.assign(0.0)
+    p_i     = fd.interpolate(fd.Constant(ice_density * gravity) * H, U)
+    phi_m   = fd.interpolate(fd.Constant(water_density * gravity) * B, U)
+    phi_0   = fd.interpolate(p_i + phi_m, U)
 
-    rho_i, g = 917.0, 9.81
-    p_i  = fd.project(fd.Constant(rho_i*g)*H, U)
-    phi_m = fd.Function(U); phi_m.assign(0.0)
-    phi_0 = fd.project(p_i, U)
+    bc      = fd.DirichletBC(U, phi_m, 1)
 
-    pcs = dict(default_pcs)
+    h_init   = fd.interpolate(fd.Constant(0.01), U)
+    S_init   = fd.interpolate(fd.Constant(0.001), CR)
+    phi_init = fd.Function(U).interpolate(phi_0)
+
+    m        = fd.Function(U); m.assign(0.0)
 
     return dict(
-        mesh=mesh, thickness=H, bed=B, u_b=u_b, m=m,
-        h_init=h_init, S_init=S_init,
-        phi_init=phi_init, phi_m=phi_m, p_i=p_i, phi_0=phi_0,
-        d_bcs=[], constants=pcs, out_dir=OUTDIR
+        thickness= H,
+        bed      = B,
+        sliding_speed = u_b,
+        melt_rate= m,
+        h_init   = h_init,
+        S_init   = S_init,
+        phi_init = phi_init,
+        phi_m    = phi_m,
+        p_i      = p_i,
+        phi_0    = phi_0,
+        dirichlet_bcs = [bc],
+        englacial_void_ratio = 1e-4,
+        out_dir  = OUTDIR,
     )
 
-def apply_margin_bc(model):
-    # RectangleMesh: x=0 side is boundary id 1
-    model.d_bcs = [fd.DirichletBC(model.U, 0.0, 1)]
 
 def total_domain_area(mesh):
-    one = fd.Constant(1.0)
-    return float(fd.assemble(one*fd.dx(domain=mesh)))
+    return float(fd.assemble(fd.Constant(1.0) * fd.dx(domain=mesh)))
+
+
+def load_moulin_csv(tag):
+    """Load SHMIP moulin positions. Returns (pts, q_total)."""
+    path = os.path.join(MOULIN_DIR, f"{tag}_M.csv")
+    data = np.loadtxt(path, delimiter=",")
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    pts     = [(float(row[1]), float(row[2])) for row in data]
+    q_total = float(np.sum(data[:, 3]))
+    return pts, q_total
+
 
 def gaussian_blobs(mesh, points, sigma):
-    """Return a CG1 function that is a sum of Gaussians centered at points; normalized to integrate to 1."""
-    U = fd.FunctionSpace(mesh, "CG", 1)
+    """Normalised sum of Gaussians (integrates to 1 over the domain)."""
+    U    = fd.FunctionSpace(mesh, "CG", 1)
     x, y = fd.SpatialCoordinate(mesh)
-    blobs = [fd.exp(-((x-xi)**2 + (y-yi)**2)/(2*sigma**2)) for (xi, yi) in points]
-    if not blobs:
+    if not points:
         f = fd.Function(U); f.assign(0.0); return f
-    g = sum(blobs)
-    mass = fd.assemble(g*fd.dx)
-    g_norm = g / (mass + 1e-16)
-    return fd.interpolate(g_norm, U)
+    g    = sum(fd.exp(-((x - xi)**2 + (y - yi)**2) / (2 * sigma**2))
+               for (xi, yi) in points)
+    mass = fd.assemble(g * fd.dx)
+    return fd.interpolate(g / (mass + 1e-30), U)
 
-def place_moulins(mesh, n, seed=1, margin_buffer=2e3):
-    """Uniform random interior moulin locations (simple; replace with your SHMIP grid if you like)."""
-    rng = np.random.default_rng(seed)
-    # bounds
-    xy = mesh.coordinates.dat.data_ro
-    xmin, xmax = float(xy[:,0].min()), float(xy[:,0].max())
-    ymin, ymax = float(xy[:,1].min()), float(xy[:,1].max())
-    xmin += margin_buffer
-    pts = np.c_[rng.uniform(xmin, xmax, n), rng.uniform(ymin, ymax, n)]
-    return [tuple(p) for p in pts]
 
-def build_moulin_recharge(model, n_moulins, Q_total, seed=1):
-    """
-    Returns a callable set_recharge() that sets model.m each step to:
-      m = A1 (distributed background) + moulin blobs summing to Q_total / H_ref
-    Units: if your model expects water thickness rate [m/s], we convert volumetric discharge to areal by dividing by domain area.
-    """
-    A = fd.FunctionSpace(model.mesh, "CG", 1)
-    # background A1 (distributed)
-    bg_rate = A1
-    area = total_domain_area(model.mesh)
+def build_recharge_field(mesh, tag):
+    """Return CG1 total recharge: A1 background + moulin Gaussians."""
+    U    = fd.FunctionSpace(mesh, "CG", 1)
 
-    # place moulins and build normalized blob function
-    pts = place_moulins(model.mesh, n_moulins, seed=seed)
-    sigma = float(model.mesh.cell_sizes.dat.data_ro.min())  # ~ cell size
-    blob = gaussian_blobs(model.mesh, pts, sigma)
+    pts, Q_moulin = load_moulin_csv(tag)
+    print(f"  Loaded {len(pts)} moulin(s) from {tag}_M.csv,"
+          f" Q_total={Q_moulin:.1f} m³/s", flush=True)
 
-    # Convert Q_total [m^3/s] to an *areal* recharge [m/s] by spreading the volume over the normalized blob.
-    # Because blob integrates to 1 over area, Q_total/area is the mean rate; multiplying by blob gives spatial pattern.
-    q_areal = (Q_total / area) * blob
+    blob     = gaussian_blobs(mesh, pts, MOULIN_SIGMA)
+    m_moulin = fd.Function(U).interpolate(fd.Constant(Q_moulin) * blob)
+    m_full   = fd.Function(U).interpolate(fd.Constant(A1_RATE) + m_moulin)
+    return m_full
 
-    def set_recharge():
-        model.m.interpolate(fd.Constant(bg_rate) + q_areal)
 
-    return set_recharge
+def advance_to_steady(model, dt, *, rel_tol=5e-4, max_steps=30000,
+                      check_every=6):
+    """Step until phi, N, h, and S all converge."""
+    phi_prev = fd.Function(model.U).interpolate(model.phi)
+    N_prev   = fd.Function(model.U).interpolate(model.N)
+    h_prev   = fd.Function(model.U).interpolate(model.h)
+    S_prev   = fd.Function(model.CR).interpolate(model.S)
 
-def advance_to_steady(model):
-    eps = 1e-12
-    phi_prev = fd.Function(model.U).assign(model.phi)
-    N_prev   = fd.Function(model.U).assign(model.N)
-    for k in range(1, max_steps+1):
-        model.step(dt)
+    n_failures = 0
+    for k in range(1, max_steps + 1):
+        try:
+            model.step(dt)
+        except Exception as e:
+            n_failures += 1
+            if n_failures <= 20:
+                print(f"  [step {k}] Newton failure ({type(e).__name__}), skipping step "
+                      f"({n_failures} total)", flush=True)
+                model.phi.assign(phi_prev)
+                model.update_phi()
+                continue
+            else:
+                print(f"  Too many Newton failures ({n_failures}), aborting.", flush=True)
+                return k
+
         if k % check_every == 0:
             model.update_phi()
-            rphi = fd.norm(model.phi - phi_prev) / (fd.norm(model.phi) + eps)
-            rN   = fd.norm(model.N   - N_prev)   / (fd.norm(model.N)   + eps)
-            print(f"iter {k}: rphi={rphi:.3e}, rN={rN:.3e}")
+
+            rphi = fd.norm(model.phi - phi_prev) / (fd.norm(model.phi) + 1e-30)
+            rN   = fd.norm(model.N   - N_prev)   / (fd.norm(model.N)   + 1e-30)
+            rh   = fd.norm(model.h   - h_prev)   / (fd.norm(model.h)   + 1e-30)
+            rS   = fd.norm(model.S   - S_prev)   / (fd.norm(model.S)   + 1e-30)
+
+            sim_days = k * dt / 86400
+            print(f"iter {k} ({sim_days:.0f}d): rphi={rphi:.3e}, rN={rN:.3e}, rh={rh:.3e}, rS={rS:.3e}",
+                  flush=True)
+
             phi_prev.assign(model.phi)
             N_prev.assign(model.N)
-            if (rphi < rel_tol) and (rN < rel_tol):
+            h_prev.assign(model.h)
+            S_prev.assign(model.S)
+
+            if rphi < rel_tol and rN < rel_tol and rh < rel_tol and rS < rel_tol:
                 return k
+
     print("WARNING: hit max_steps without steady convergence.")
     return max_steps
 
-def width_averaged_Nx(model, nbins=200):
+
+def width_averaged_Nx(model, nbins=None):
     coords = model.mesh.coordinates.dat.data_ro
-    x = coords[:,0]
-    Nvals = model.N.dat.data_ro
-    bins = np.linspace(0.0, Lx, nbins+1)
-    idx = np.digitize(x, bins) - 1
-    Nx = np.zeros(nbins); count = np.zeros(nbins, dtype=int)
+    x      = coords[:, 0]
+    Nvals  = model.N.dat.data_ro
+    if nbins is None:
+        nbins = nx
+    bins   = np.linspace(0.0, Lx, nbins + 1)
+    idx    = np.digitize(x, bins) - 1
+    Nx     = np.zeros(nbins)
+    count  = np.zeros(nbins, dtype=int)
     for i, val in zip(idx, Nvals):
         if 0 <= i < nbins:
             Nx[i] += val; count[i] += 1
-    mask = count > 0
+    mask   = count > 0
     Nx[mask] /= count[mask]
-    xc = 0.5*(bins[:-1] + bins[1:])
+    xc     = 0.5 * (bins[:-1] + bins[1:])
     return xc, Nx
+
 
 def save_checkpoint(model, tag):
     os.makedirs(CHK_DIR, exist_ok=True)
     path = os.path.join(CHK_DIR, f"{tag}.h5")
     with fd.CheckpointFile(path, "w") as chk:
         chk.save_mesh(model.mesh)
-        for name in ("h","S","phi","pfo","N","N_cr","h_cr","S_alpha","p_w","m", "q_s", "q_s_mag", "Q_ch"):
+        for name in ("h", "S", "phi", "pfo", "N", "N_cr", "h_cr",
+                     "S_alpha", "p_w", "m", "q_s", "q_s_mag", "Q_ch"):
             if hasattr(model, name):
                 chk.save_function(getattr(model, name), name=name)
     return path
 
-# ---------------- main driver ----------------
-def main(cases=None, seed=1):
+
+def main(cases=None):
     os.makedirs(OUTDIR, exist_ok=True)
     os.makedirs(CSV_DIR, exist_ok=True)
 
-    if cases is None or len(cases) == 0:
-        cases = list(B_MAP.keys())
+    if not cases:
+        cases = CASES_ALL
 
-    mesh = build_mesh()
-    # Total volumetric discharge used for moulins: match A5 total (rate × area)
-    Q_total = A5 * total_domain_area(mesh)
-
+    mesh  = build_mesh()
     all_x = None
     curves = {}
 
     for tag in cases:
         n_moulins = B_MAP[tag]
-        print(f"\n=== {tag}: {n_moulins} moulin(s) ===")
+        print(f"\n=== {tag}: {n_moulins} moulin(s) ===", flush=True)
 
         model_inputs = make_model_inputs(mesh)
-        model = Glads2DModel(model_inputs)
-        apply_margin_bc(model)
+        model        = SubglacialHydrologyModel(mesh, **model_inputs)
 
-        set_recharge = build_moulin_recharge(model, n_moulins, Q_total, seed=seed)
+        m_full = build_recharge_field(mesh, tag)
 
-        # march to steady
-        k = 0
-        for k in range(1, max_steps+1):
-            set_recharge()      # keep recharge applied
-            model.step(dt)
-            if k % check_every == 0:
-                model.update_phi()
-                # steady check
-                rphi = fd.norm(model.phi - model.phi_prev) / (fd.norm(model.phi) + 1e-12)
-                rN   = 0.0  # model.update_phi() already refreshed N; use phi-only or add N like in A
-                print(f"iter {k}: rphi={rphi:.3e}")
-                if rphi < rel_tol:
-                    break
-        print(f"{tag}: steady after {k} iterations")
+        dt_ramp = 60 * 5
+        m_bg = fd.Function(model.U).interpolate(fd.Constant(A1_RATE))
+        model.m.assign(m_bg)
+        for _ in range(300):
+            model.step(dt_ramp)
+        model.update_phi()
+        print("  Phase 1 (A1 background) complete", flush=True)
+
+        m_moulin = fd.Function(model.U).interpolate(m_full - m_bg)
+        for frac in [0.05, 0.1, 0.2, 0.4, 0.7, 1.0]:
+            model.m.interpolate(fd.Constant(A1_RATE) + fd.Constant(frac) * m_moulin)
+            for _ in range(200):
+                model.step(dt_ramp)
+            model.update_phi()
+            print(f"  Ramp frac={frac:.2f} complete", flush=True)
+
+        model.m.assign(m_full)
+        model.compute_flux_fields()
+
+        iters = advance_to_steady(model, dt, rel_tol=rel_tol,
+                                  max_steps=max_steps,
+                                  check_every=check_every)
+        print(f"{tag}: converged in {iters} checks.", flush=True)
 
         model.update_phi()
+        model.compute_flux_fields()
 
-        # checkpoint + Nx curve
         cpath = save_checkpoint(model, tag)
-        print(f"{tag}: wrote {cpath}")
+        print(f"{tag}: checkpoint → {cpath}")
 
         x, Nx = width_averaged_Nx(model)
-        if all_x is None: all_x = x
+        if all_x is None:
+            all_x = x
         csv = os.path.join(CSV_DIR, f"{tag}_Nx.csv")
         np.savetxt(csv, np.c_[x, Nx], delimiter=",", header="x,N", comments="")
-        print(f"{tag}: saved {csv}")
+        print(f"{tag}: N(x) → {csv}")
         curves[tag] = Nx
 
-    # plot
-    plt.figure(figsize=(8,4.5))
+    plt.figure(figsize=(8, 4.5))
     for tag in cases:
-        plt.plot(all_x/1000.0, curves[tag], label=f"{tag} ({B_MAP[tag]})")
-    plt.xlabel("x (km)")
-    plt.ylabel("Width-averaged effective pressure N (Pa)")
+        plt.plot(all_x / 1000.0, curves[tag], label=f"{tag} ({B_MAP[tag]} moulins)")
+    plt.xlabel("x  (km)")
+    plt.ylabel("Width-averaged effective pressure  N  (Pa)")
     plt.title("SHMIP Suite B: N(x) at steady state")
     plt.grid(True, alpha=0.25)
-    plt.legend(ncol=3, fontsize=9)
+    plt.legend(ncol=2, fontsize=9)
     plt.tight_layout()
     plt.savefig(FIG, dpi=200)
     print(f"Saved figure → {FIG}")
 
     np.savez(os.path.join(OUTDIR, "B_curves.npz"), x=all_x, **curves)
 
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cases", nargs="*", default=None, help="Subset like B1 B5")
-    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--cases", nargs="*", default=None,
+                    help="Subset of cases, e.g. B1 B3 B5")
     args = ap.parse_args()
-    main(args.cases, args.seed)
+    main(args.cases)
